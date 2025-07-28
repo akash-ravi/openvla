@@ -122,12 +122,12 @@ class DinoCLIPViTBackbone(VisionBackbone):
         transformer_block_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
         return partial(_or_policy, policies=[vit_wrap_policy, transformer_block_policy])
 
-    def forward(self, pixel_values: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, pixel_values: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Runs the transformed image/pixel tensors through each vision backbone, returning concatenated patches."""
         dino_patches = self.dino_featurizer(pixel_values["dino"])
         clip_patches = self.clip_featurizer(pixel_values["clip"])
 
-        return torch.cat([dino_patches, clip_patches], dim=2)
+        return torch.cat([dino_patches, clip_patches], dim=2), dino_patches, clip_patches
 
     @property
     def default_image_resolution(self) -> Tuple[int, int, int]:
