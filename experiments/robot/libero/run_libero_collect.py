@@ -300,6 +300,8 @@ def validate_episode_file(path: Path, task_id: int, init_state_idx: int, seed: i
         return "action_token_ids shape"
     if tuple(np.asarray(steps["executed_action"]).shape) != (T, ACTION_DIM):
         return "executed_action shape"
+    if len(steps.get("token_out_of_range", [])) != T or meta.get("n_out_of_range_token_steps") is None:
+        return "token_out_of_range / meta count missing"
     for k in ("token_probs", "token_entropy"):
         if tuple(np.asarray(steps.get(k, [])).shape) != (T, ACTION_DIM):
             return f"{k} shape"
@@ -318,7 +320,11 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
     env.reset()
     obs = env.set_init_state(init_state)
     t = 0
-    s_list, env_t_list, tok_list, act_list, prob_list, ent_list = [], [], [], [], [], []
+    s_list, env_t_list, tok_list, act_list, prob_list, ent_list, oor_list = [], [], [], [], [], [], []
+    # Action-bin token range = exactly the logits slice used for token_probs/entropy (unc_utils.py) and the range
+    # predict_action decodes: ids in [vocab_size - n_action_bins + 1, vocab_size].
+    vocab_size = model.config.text_config.vocab_size - model.config.pad_to_multiple_of
+    bin_lo, bin_hi = vocab_size - model.config.n_action_bins + 1, vocab_size
     feats = {}
     success = False
     while t < max_steps + cfg.num_steps_wait:
@@ -346,7 +352,11 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
 
         s_list.append(t - cfg.num_steps_wait)
         env_t_list.append(t)
-        tok_list.append(generated_outputs["sequences"][0, -ACTION_DIM:].cpu().numpy())
+        tok = generated_outputs["sequences"][0, -ACTION_DIM:].cpu().numpy()
+        tok_list.append(tok)
+        # Under greedy decoding the chosen token can fall outside the action bins; the fork then clips the action
+        # and token_probs is NOT the chosen token's probability. We keep SAFE's prob definition and just count these.
+        oor_list.append(bool(((tok < bin_lo) | (tok > bin_hi)).any()))
         act_list.append(np.asarray(actions, dtype=np.float32))
         # Same computation as run_libero_eval.py logs: softmax over the action-bin slice of the logits;
         # "prob" = max bin prob (== chosen token's prob under greedy when the argmax is a bin token).
@@ -366,9 +376,11 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
         "action_token_ids": np.stack(tok_list) if tok_list else np.zeros((0, ACTION_DIM), dtype=np.int64),
         "executed_action": np.stack(act_list) if act_list else np.zeros((0, ACTION_DIM), dtype=np.float32),
         "features": {k: torch.stack(v) for k, v in feats.items()},  # [T, 3, 4096] once capture is real
+        "token_out_of_range": np.asarray(oor_list, dtype=bool),  # [T]: any of the 7 chosen ids outside the bins
         "token_probs": np.asarray(prob_list, dtype=np.float32).reshape(-1, ACTION_DIM),
         "token_entropy": np.asarray(ent_list, dtype=np.float32).reshape(-1, ACTION_DIM),
     }
+    steps["action_bin_range"] = (int(bin_lo), int(bin_hi))
     return steps, success, len(s_list)
 
 
@@ -455,7 +467,11 @@ def collect(cfg: CollectConfig) -> None:
                         cfg, model, processor, env, task_description, initial_states[idx],
                         MAX_STEPS_LIBERO_10, resize_size, capture,
                     )
-                    meta.update(success=bool(success), label_failure=int(not success), length=n, invalid=False, error=None)
+                    oor = steps.pop("action_bin_range")
+                    meta.update(success=bool(success), label_failure=int(not success), length=n, invalid=False, error=None,
+                                n_out_of_range_token_steps=int(steps["token_out_of_range"].sum()),
+                                out_of_range_token_rate=float(steps["token_out_of_range"].mean()) if n else 0.0,
+                                action_bin_token_range=list(oor))
                     episode = {"meta": meta, "steps": steps}  # TODO(A2): "inputs"
                     stats["success" if success else "failure"] += 1
                 except Exception:
