@@ -28,6 +28,7 @@ def make_episode(task, idx, seed=7, success=True, T=8, wall=4.0, ids=None, oor=N
     oor_arr = np.zeros(T, dtype=bool) if oor is None else oor
     meta = dict(BASE_META, task_id=task, init_state_idx=idx, seed=seed, invalid=False, error=None, success=success,
                 label_failure=int(not success), length=T, wall_time_s=wall,
+                features_captured=True, layer_keys=["block_4"], pooling=["first", "last", "mean"], layer_mean_def=None,
                 n_out_of_range_token_steps=int(oor_arr.sum()), out_of_range_token_rate=float(oor_arr.mean()),
                 action_bin_token_range=[31744, 31999], n_tokens_at_bin_min_edge=min_edge, n_tokens_at_pad_edge=pad)
     if attn:
@@ -50,7 +51,7 @@ def make_invalid(task, idx, seed=7):
 def save(root, ep):
     m = ep["meta"]
     p = cio.episode_path(root, m["task_id"], m["init_state_idx"], m["seed"])
-    cio.atomic_save(ep, p)
+    cio.save_episode(ep, p)  # .pt + .meta.json sidecar
     return p
 
 
@@ -77,8 +78,13 @@ def dirty_root(tmp_path, monkeypatch):
     save(root, make_episode(0, 4, success=False, T=MAX_STEPS))
     save(root, make_episode(0, 5, success=False, T=MAX_STEPS, attn="sdpa"))
     (root / "task00" / "notes.txt").write_text("stray")
+    sc2 = cio.sidecar_path(cio.episode_path(root, 0, 2, 7))  # sidecar disagrees with its .pt on a field no stat uses
+    d = json.loads(sc2.read_text())
+    d["meta"]["task_description"] = "tampered"
+    sc2.write_text(json.dumps(d))
     # task 1: failure, invalid (exception), corrupt, duplicate (two seeds), missing idx 4,5
-    save(root, make_episode(1, 0, success=False, T=MAX_STEPS))
+    p10 = save(root, make_episode(1, 0, success=False, T=MAX_STEPS))
+    cio.sidecar_path(p10).unlink()  # crash between the .pt rename and the sidecar write
     save(root, make_invalid(1, 1))
     cio.episode_path(root, 1, 2, 7).write_bytes(b"not a torch file")
     save(root, make_episode(1, 3, seed=7, success=True))
@@ -103,6 +109,7 @@ def dirty_root(tmp_path, monkeypatch):
     save(root, make_episode(3, 0, success=True, T=8, ids=ids, oor=oor, min_edge=1, pad=1))
     save(root, make_episode(3, 1, success=True, T=MAX_STEPS))
     save(root, make_episode(3, 2, success=False, T=15))
+    cio.sidecar_path(cio.episode_path(root, 3, 5, 7)).write_text(json.dumps({"format": 1, "meta": {}}))  # orphan sidecar
     cio.lock_path(cio.episode_path(root, 3, 3, 7)).write_text(
         json.dumps(dict(job_id="999", restart="0", host="otherhost", pid=1, time=time.time())))
     cio.episode_path(root, 3, 3, 7).with_name("ep003_seed7.pt.999.tmp").write_bytes(b"partial")
@@ -124,6 +131,8 @@ def test_audit_flags_everything_and_is_read_only(dirty_root, tmp_path, capsys):
     code, r = run_audit(dirty_root, tmp_path)
     after = snapshot(dirty_root)
     assert before == after, "audit modified the collection folder"
+    assert ("SIDECAR_MISMATCH", 0) in codes(r) and ("SIDECAR_MISSING", 1) in codes(r) and ("SIDECAR_ORPHAN", 3) in codes(r)
+    assert "task_description" in [f for f in r["flags"] if f["code"] == "SIDECAR_MISMATCH" and f["task"] == 0][0]["detail"]
     assert code == 1
     c = codes(r)
     t = r["tasks"]
@@ -190,6 +199,89 @@ def test_json_inside_collection_folder_is_refused(tmp_path):
     root.mkdir()
     with pytest.raises(SystemExit):
         audit.main([str(root), "--json", str(root / "a.json")])
+
+
+# ----------------------------------------------------------------------------- sidecar / --fast
+def test_fast_mode_never_opens_pt_and_is_read_only(dirty_root, tmp_path, monkeypatch):
+    code_full, full = run_audit(dirty_root, tmp_path)
+
+    def boom(*a, **k):
+        raise AssertionError("--fast must not open any .pt")
+    monkeypatch.setattr(torch, "load", boom)
+    before = snapshot(dirty_root)
+    out = tmp_path / "fast.json"
+    code = audit.main([str(dirty_root), "--num-tasks", "4", "--n-episodes", "6", "--json", str(out), "--fast"])
+    assert snapshot(dirty_root) == before
+    fast = json.loads(out.read_text())
+    assert code == 1 and fast["mode"] == "fast"
+    c = codes(fast)
+    assert ("SIDECAR_MISSING", 1) in c and ("SIDECAR_ORPHAN", 3) in c
+    # fast cannot see a corrupt .pt (it has no sidecar here, so it is reported as missing sidecar instead)
+    assert ("FAILED_VALIDATION", 1) not in c
+    # tasks with intact sidecars give the same statistics as full mode (task 0 has a sidecar disagreeing only on task_description)
+    for t in ("0", "2", "3"):
+        for k in ("valid", "invalid", "success", "failure", "total_steps", "lengths", "token_checks", "at_max_steps",
+                  "bytes_feature_total", "bytes_input_total", "steps_per_sec"):
+            assert fast["tasks"][t][k] == full["tasks"][t][k], (t, k)
+    # a field mismatch other than pt_bytes is only detectable in full mode
+    assert ("SIDECAR_MISMATCH", 0) not in c and ("SIDECAR_MISMATCH", 0) in codes(full)
+
+
+def test_fast_flags_pt_size_mismatch(tmp_path):
+    root = tmp_path / "c"
+    p = save(root, make_episode(0, 0))
+    with open(p, "ab") as f:
+        f.write(b"extra")  # .pt changed after the sidecar was written
+    out = tmp_path / "a.json"
+    audit.main([str(root), "--num-tasks", "1", "--n-episodes", "1", "--json", str(out), "--fast"])
+    assert ("SIDECAR_MISMATCH", 0) in codes(json.loads(out.read_text()))
+
+
+def test_save_episode_writes_sidecar_atomically_and_ensure_sidecar_repairs(tmp_path):
+    root = tmp_path / "c"
+    ep = make_episode(0, 1)
+    p = cio.episode_path(root, 0, 1, 7)
+    n = cio.save_episode(ep, p)
+    sp = cio.sidecar_path(p)
+    assert sp.name == "ep001_seed7.meta.json" and sp.exists()
+    assert not list(root.glob("task*/*.tmp"))
+    sc = cio.read_sidecar(p)
+    assert sc["pt_bytes"] == n and sc["feature_bytes"] == 8 * 3 * 8 * 2 and sc["meta"]["success"] is True
+    assert cio.sidecar_mismatch(sc, torch.load(p, weights_only=False), n) is None
+    assert cio.ensure_sidecar(p, torch.load(p, weights_only=False)) is False  # already consistent
+    sp.unlink()  # crash between the two renames
+    assert cio.ensure_sidecar(p, torch.load(p, weights_only=False)) is True and sp.exists()
+    sp.write_text("{not json")
+    assert cio.ensure_sidecar(p, torch.load(p, weights_only=False)) is True
+    assert cio.read_sidecar(p)["pt_bytes"] == n
+
+
+def test_quarantine_moves_sidecar_too(tmp_path):
+    root = tmp_path / "c"
+    p = save(root, make_episode(0, 2))
+    cio.quarantine(p, root, "test")
+    assert not p.exists() and not cio.sidecar_path(p).exists()
+    names = sorted(x.name for x in (root / "_quarantine").iterdir())
+    assert sum(n.endswith(".meta.json") for n in names) == 1 and len(names) == 3  # pt, sidecar, log
+
+
+def test_validation_of_feature_fields(tmp_path):
+    root = tmp_path / "c"
+    ep = make_episode(0, 0)
+    ep["steps"]["features"]["block_4"] = ep["steps"]["features"]["block_4"].float()  # not bf16
+    p = save(root, ep)
+    assert "dtype" in cio.validate_episode_file(p, 0, 0, 7)
+    ep = make_episode(0, 1)
+    ep["meta"]["layer_keys"] = ["block_4", "block_8"]  # features missing a declared key
+    p = save(root, ep)
+    assert "feature keys" in cio.validate_episode_file(p, 0, 1, 7)
+    ep = make_episode(0, 2)
+    ep["token_level_sample"] = torch.zeros(8, 7, 2, 8, dtype=torch.bfloat16)  # no meta.token_level_keys
+    p = save(root, ep)
+    assert "token_level_sample" in cio.validate_episode_file(p, 0, 2, 7)
+    ep["meta"]["token_level_keys"] = ["block_4", "final_norm"]
+    p = save(root, ep)
+    assert cio.validate_episode_file(p, 0, 2, 7) is None
 
 
 # ----------------------------------------------------------------------------- projection

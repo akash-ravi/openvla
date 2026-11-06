@@ -149,6 +149,96 @@ def atomic_save(obj, path: Path) -> int:
         raise
 
 
+SIDECAR_FORMAT = 1
+
+
+def sidecar_path(pt_path: Path) -> Path:
+    """ep{NNN}_seed{S}.pt -> ep{NNN}_seed{S}.meta.json"""
+    assert pt_path.name.endswith(".pt"), pt_path
+    return pt_path.with_name(pt_path.name[: -len(".pt")] + ".meta.json")
+
+
+def _tensor_bytes(obj) -> int:
+    if isinstance(obj, torch.Tensor):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, np.ndarray):
+        return int(obj.nbytes)
+    if isinstance(obj, dict):
+        return sum(_tensor_bytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_tensor_bytes(v) for v in obj)
+    return 0
+
+
+def build_sidecar(episode: dict, pt_bytes: int) -> dict:
+    """Small JSON-able summary of an episode: its meta plus sizes, so audits can run without loading the .pt."""
+    return {
+        "format": SIDECAR_FORMAT,
+        "meta": json.loads(json.dumps(episode["meta"], default=str)),  # JSON round-trip, exactly what is compared later
+        "pt_bytes": int(pt_bytes),
+        "feature_bytes": _tensor_bytes(episode.get("steps", {}).get("features", {})),
+        "input_bytes": _tensor_bytes(episode.get("inputs", {})),
+        "token_level_bytes": _tensor_bytes(episode.get("token_level_sample", {})),
+    }
+
+
+def atomic_write_json(obj, path: Path) -> int:
+    """Same rules as atomic_save: per-job temp name, fsync, os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{_tmp_id()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        size = os.path.getsize(tmp)
+        os.replace(tmp, path)
+        return size
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def save_episode(episode: dict, path: Path) -> int:
+    """Atomic .pt write, THEN the atomic .meta.json sidecar. A crash between the two leaves a valid .pt without
+    sidecar; the collector regenerates it on resume (ensure_sidecar). Returns .pt bytes."""
+    nbytes = atomic_save(episode, path)
+    atomic_write_json(build_sidecar(episode, nbytes), sidecar_path(path))
+    return nbytes
+
+
+def read_sidecar(pt_path: Path) -> Optional[dict]:
+    sp = sidecar_path(pt_path)
+    try:
+        return json.loads(sp.read_text())
+    except Exception:
+        return None
+
+
+def sidecar_mismatch(sidecar: dict, episode: dict, pt_bytes: int) -> Optional[str]:
+    """None if the sidecar agrees with the loaded .pt (meta and size), else a reason."""
+    if sidecar.get("format") != SIDECAR_FORMAT:
+        return f"sidecar format {sidecar.get('format')}"
+    want = json.loads(json.dumps(episode["meta"], default=str))
+    if sidecar.get("meta") != want:
+        diff = sorted(k for k in set(want) | set(sidecar.get("meta", {})) if want.get(k) != sidecar.get("meta", {}).get(k))
+        return f"meta differs in {diff}"
+    if sidecar.get("pt_bytes") != pt_bytes:
+        return f"pt_bytes {sidecar.get('pt_bytes')} != {pt_bytes}"
+    return None
+
+
+def ensure_sidecar(pt_path: Path, episode: dict) -> bool:
+    """Write the sidecar if missing or inconsistent with the (valid) .pt. Returns True if (re)written."""
+    sc = read_sidecar(pt_path)
+    size = pt_path.stat().st_size
+    if sc is not None and sidecar_mismatch(sc, episode, size) is None:
+        return False
+    atomic_write_json(build_sidecar(episode, size), sidecar_path(pt_path))
+    return True
+
+
 def remove_stale_tmp(root: Path, max_age_h: float) -> int:
     """Remove only temp files older than max_age_h whose owning job (id in the file name) is not running."""
     n = 0
@@ -169,6 +259,9 @@ def quarantine(path: Path, root: Path, reason: str) -> Path:
     qdir.mkdir(parents=True, exist_ok=True)
     dest = qdir / f"{path.parent.name}__{path.name}.{time.strftime('%Y%m%dT%H%M%S')}.{_tmp_id()}"
     shutil.move(str(path), str(dest))
+    sp = sidecar_path(path)
+    if sp.exists():
+        shutil.move(str(sp), str(qdir / (dest.name + ".meta.json")))
     print(f"[quarantine] {path} -> {dest} ({reason})")
     with open(qdir / "quarantine_log.txt", "a") as f:
         f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{path}\t{dest}\t{reason}\n")
@@ -231,9 +324,27 @@ def _validate_loaded(ep, task_id: int, init_state_idx: int, seed: int) -> Option
     for k in ("token_probs", "token_entropy"):
         if tuple(np.asarray(steps.get(k, [])).shape) != (T, ACTION_DIM):
             return f"{k} shape"
-    for k, v in steps.get("features", {}).items():
+    feats = steps.get("features", {})
+    for k, v in feats.items():
         if v.shape[0] != T:
             return f"feature {k} length {v.shape[0]} != {T}"
+    if meta.get("features_captured"):
+        keys, pooling = meta.get("layer_keys"), meta.get("pooling")
+        if not keys or not pooling:
+            return "features_captured but meta.layer_keys/pooling missing"
+        if sorted(feats) != sorted(keys):
+            return f"feature keys {sorted(feats)} != meta.layer_keys {sorted(keys)}"
+        for k, v in feats.items():
+            if v.dtype != torch.bfloat16 or v.ndim != 3 or v.shape[1] != len(pooling):
+                return f"feature {k} dtype/shape {v.dtype}/{tuple(v.shape)} (expected bf16 [T,{len(pooling)},D])"
+        for need in ("layer_mean_def", "attn_implementation"):
+            if need not in meta:
+                return f"meta.{need} missing"
+    tl = ep.get("token_level_sample")
+    if tl is not None:
+        tk = meta.get("token_level_keys")
+        if not tk or tl.dtype != torch.bfloat16 or tl.ndim != 4 or tl.shape[0] != T or tl.shape[2] != len(tk):
+            return "token_level_sample dtype/shape inconsistent with meta.token_level_keys"
     return None
 
 

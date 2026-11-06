@@ -7,6 +7,10 @@ metrics, so it is fine to run on every task.
 
   python experiments/robot/libero/audit_collection.py /scratch1/akashrav/data/<run> --json audit.json
 
+--fast reads ONLY the .meta.json sidecars (plus os.stat of the .pt files): no .pt is opened, so it is quick on large
+collections but cannot detect a corrupt/truncated .pt. Full mode loads every .pt, validates it, and verifies that each
+sidecar matches its .pt meta (SIDECAR_MISMATCH).
+
 Exit code: 0 = clean, 1 = something flagged (use --warn-only to always exit 0).
 """
 import argparse
@@ -23,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # fork repo root
 from experiments.robot.libero import collect_io as cio  # noqa: E402
 
 EP_RE = re.compile(r"^ep(\d{3})_seed(\d+)\.pt$")
+SC_RE = re.compile(r"^ep(\d{3})_seed(\d+)\.meta\.json$")
 TASK_RE = re.compile(r"^task(\d{2})$")
 CONSISTENCY_FIELDS = ("task_suite", "checkpoint", "processor_revision", "attn_implementation", "center_crop", "dtype",
                       "unnorm_key", "num_steps_wait", "max_steps", "git_commit", "versions")
@@ -57,7 +62,7 @@ def _freeze(v):
 
 
 def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_hours=24.0, stale_lock_hours=24.0,
-          oor_rate_warn=1e-3, edge_rate_warn=1e-3) -> dict:
+          oor_rate_warn=1e-3, edge_rate_warn=1e-3, fast=False) -> dict:
     now = time.time()
     flags = []
 
@@ -92,6 +97,7 @@ def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_h
             "token_checks": {}, "locks": [], "tmp_files": [],
         }
         by_idx = defaultdict(list)
+        sidecar_keys = set()
         lens_valid, sps_list, file_bytes = [], [], []
         oor_steps = min_edge = pad_edge = 0
         err_types = Counter()
@@ -125,6 +131,10 @@ def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_h
                     if not alive:
                         flag("STALE_LOCK", t, f"{name} holder={holder or 'unreadable'} age {age_h:.1f} h")
                     continue
+                ms = SC_RE.match(name)
+                if ms:
+                    sidecar_keys.add((int(ms.group(1)), int(ms.group(2))))
+                    continue
                 m = EP_RE.match(name)
                 if not m:
                     if ".stale." in name:
@@ -139,10 +149,14 @@ def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_h
                 by_idx[idx].append((seed, p, size))
         qdir = root / "_quarantine"
         if qdir.is_dir():
-            T["quarantined"] = sum(1 for q in qdir.iterdir() if q.name.startswith(f"task{t:02d}__"))
+            T["quarantined"] = sum(1 for q in qdir.iterdir()
+                                   if q.name.startswith(f"task{t:02d}__") and not q.name.endswith(".meta.json"))
             if T["quarantined"]:
                 flag("QUARANTINED", t, f"{T['quarantined']} file(s) in _quarantine/")
 
+        for (i_, s_) in sorted(sidecar_keys):
+            if not any(sd == s_ for sd, _p, _sz in by_idx.get(i_, [])):
+                flag("SIDECAR_ORPHAN", t, f"ep{i_:03d}_seed{s_}.meta.json has no .pt")
         seeds_seen = set()
         for idx in sorted(by_idx):
             entries = by_idx[idx]
@@ -153,13 +167,39 @@ def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_h
                 seeds_seen.add(seed)
                 if expect_seed is not None and seed != expect_seed:
                     flag("UNEXPECTED_SEED", t, f"{p.name} (expected seed {expect_seed})")
-                ep, reason = cio.load_and_validate(p, t, idx, seed)
-                if reason is not None:
-                    T["failed_validation"] += 1
-                    fv_reasons[reason.split(":")[0]] += 1
-                    flag("FAILED_VALIDATION", t, f"{p.name}: {reason}")
-                    continue
-                meta, steps = ep["meta"], ep["steps"]
+                sc = cio.read_sidecar(p)
+                if fast:
+                    # sidecar only: never opens the .pt
+                    if sc is None:
+                        T["sidecar_missing"] = T.get("sidecar_missing", 0) + 1
+                        flag("SIDECAR_MISSING", t, f"{p.name}: no readable sidecar (--fast cannot assess this episode)")
+                        continue
+                    meta = sc["meta"]
+                    if (meta.get("task_id"), meta.get("init_state_idx"), meta.get("seed")) != (t, idx, seed):
+                        T["failed_validation"] += 1
+                        flag("FAILED_VALIDATION", t, f"{p.name}: sidecar meta does not match filename")
+                        continue
+                    if sc.get("pt_bytes") != size:
+                        flag("SIDECAR_MISMATCH", t, f"{p.name}: sidecar pt_bytes {sc.get('pt_bytes')} != size on disk {size}")
+                    feat_b, inp_b = sc.get("feature_bytes", 0), sc.get("input_bytes", 0)
+                else:
+                    ep, reason = cio.load_and_validate(p, t, idx, seed)
+                    if reason is not None:
+                        T["failed_validation"] += 1
+                        fv_reasons[reason.split(":")[0]] += 1
+                        flag("FAILED_VALIDATION", t, f"{p.name}: {reason}")
+                        continue
+                    meta, steps = ep["meta"], ep["steps"]
+                    feat_b = tensor_bytes(steps.get("features", {}))
+                    inp_b = tensor_bytes(ep.get("inputs", {}))
+                    if sc is None:
+                        T["sidecar_missing"] = T.get("sidecar_missing", 0) + 1
+                        flag("SIDECAR_MISSING", t, f"{p.name}: no readable sidecar")
+                    else:
+                        why = cio.sidecar_mismatch(sc, ep, size)
+                        if why:
+                            flag("SIDECAR_MISMATCH", t, f"{p.name}: {why}")
+                    del ep, steps
                 T["present_idx"].append(idx)
                 for f in CONSISTENCY_FIELDS:
                     meta_values[f][_freeze(meta.get(f))] += 1
@@ -179,8 +219,6 @@ def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_h
                     T["wall_time_s_total"] += wall
                     sps_list.append(n / wall)
                 file_bytes.append(size)
-                feat_b = tensor_bytes(steps.get("features", {}))
-                inp_b = tensor_bytes(ep.get("inputs", {}))
                 T["bytes_feature_total"] += feat_b
                 T["bytes_input_total"] += inp_b
                 if meta["success"]:
@@ -198,7 +236,6 @@ def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_h
                 oor_steps += meta["n_out_of_range_token_steps"]
                 min_edge += meta["n_tokens_at_bin_min_edge"]
                 pad_edge += meta["n_tokens_at_pad_edge"]
-                del ep, steps
         exp = set(range(n_episodes))
         T["present_idx"] = sorted(set(T["present_idx"]))
         T["missing_idx"] = sorted(exp - set(by_idx))  # no file at all
@@ -281,7 +318,7 @@ def audit(root: Path, num_tasks=10, n_episodes=50, expect_seed=None, stale_tmp_h
             else:
                 disk["other"] += sz
     overall["bytes_on_disk"] = disk
-    return {"root": str(root), "generated_unix": now, "params": {
+    return {"root": str(root), "mode": "fast" if fast else "full", "generated_unix": now, "params": {
                 "num_tasks": num_tasks, "n_episodes": n_episodes, "expect_seed": expect_seed,
                 "stale_tmp_hours": stale_tmp_hours, "stale_lock_hours": stale_lock_hours},
             "overall": overall, "tasks": {str(k): v for k, v in per_task.items()},
@@ -295,6 +332,8 @@ def _mb(b):
 def to_markdown(r: dict) -> str:
     o, out = r["overall"], []
     out.append(f"# Collection audit: `{r['root']}`\n")
+    if r["mode"] == "fast":
+        out.append("> **FAST mode**: only `.meta.json` sidecars were read; `.pt` files were not opened, so corrupt or truncated episodes are NOT detected.\n")
     out.append(f"**{len(r['flags'])} flag(s)** — {'CLEAN' if not r['flags'] else 'ATTENTION NEEDED'}\n")
     out.append("## Episodes and outcomes (per task)\n")
     out.append("| task | files | valid | invalid | failed-valid. | quarantined | missing | dup | succ | fail | len min/med/max | at max | sps (median) |")
@@ -379,12 +418,13 @@ def main(argv=None) -> int:
     ap.add_argument("--stale-lock-hours", type=float, default=24.0)
     ap.add_argument("--oor-rate-warn", type=float, default=1e-3)
     ap.add_argument("--edge-rate-warn", type=float, default=1e-3)
+    ap.add_argument("--fast", action="store_true", help="read only the .meta.json sidecars; do not open any .pt")
     ap.add_argument("--warn-only", action="store_true", help="always exit 0")
     a = ap.parse_args(argv)
     if a.json is not None and a.root.resolve() in a.json.resolve().parents:
         ap.error("--json must be written outside the collection folder (the audit never writes there)")
     r = audit(a.root, a.num_tasks, a.n_episodes, a.expect_seed, a.stale_tmp_hours, a.stale_lock_hours,
-              a.oor_rate_warn, a.edge_rate_warn)
+              a.oor_rate_warn, a.edge_rate_warn, fast=a.fast)
     print(to_markdown(r))
     if a.json:
         a.json.write_text(json.dumps(r, indent=2, default=str))
