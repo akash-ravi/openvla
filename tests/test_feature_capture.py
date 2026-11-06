@@ -218,3 +218,17 @@ def test_invalid_config_is_rejected(model):
         FeatureCapture(cfg(blocks=(2, 8))).attach(model)  # block 8 > L
     with pytest.raises(AssertionError):
         FeatureCapture(cfg(pooling=("median",)))
+
+
+def test_mean_pooling_accumulates_in_float32_not_bf16():
+    from experiments.robot.libero.feature_capture import pool
+    g = torch.Generator().manual_seed(0)
+    x = (torch.randn(NS, 4096, generator=g) * 3).to(BF)
+    pooled = pool(x, ("mean",))[0]
+    assert torch.equal(pooled, x.float().mean(0).to(BF))
+    naive = x[0].clone()
+    for i in range(1, NS):
+        naive = naive + x[i]  # accumulate in bf16: rounds after every add
+    naive = naive / NS
+    assert not torch.equal(pooled, naive)  # the reference is discriminating: bf16 accumulation would give a different result
+    assert pooled.dtype == BF
