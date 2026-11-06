@@ -7,22 +7,35 @@ Policy behaviour mirrors run_libero_eval.py (greedy, center_crop=True, num_steps
 libero_10, same unnorm-key logic, same gripper post-processing). Only the bookkeeping differs:
 
   * One file per episode: {out_root}/task{task_id:02d}/ep{init_state_idx:03d}_seed{seed}.pt
-  * Written atomically (temp file in the same dir -> fsync -> os.replace). A killed job never leaves a partial
-    file under the final name; stale *.tmp files are removed at startup.
+  * Written atomically (temp file `ep{NNN}_seed{S}.pt.{SLURM_JOB_ID|pid}.tmp` in the same dir -> fsync ->
+    os.replace). A killed job never leaves a partial file under the final name. At startup only temp files
+    older than --stale_tmp_hours whose job is no longer running are removed.
+  * Each episode is claimed with an O_EXCL lock file (`ep{NNN}_seed{S}.lock`: job id, host, pid). An episode
+    whose lock is held by a live job is skipped; locks of dead jobs are reclaimed. Safe for concurrent and
+    requeued Slurm jobs on the same task directory.
   * On restart an episode is skipped iff its final file exists AND validates (see validate_episode_file).
-    A file that fails validation is deleted and the episode is re-collected.
+    A file that fails validation is MOVED to {out_root}/_quarantine/ (timestamp suffix, logged), never deleted,
+    and the episode is re-collected.
+  * Deterministic per-episode seed derived from (base_seed, task_id, init_state_idx), recorded in meta, so a
+    resumed episode is identical to the same episode in an uninterrupted run. INTENTIONAL DEVIATION from SAFE,
+    which seeds once at startup (see Safe-Research docs/compute_notes.md).
+  * token_probs / token_entropy [T,7] are stored, computed with the fork's compute_token_uncertainty_metrics
+    (identical to what run_libero_eval.py logs).
   * Exceptions are recorded per episode (meta.invalid=True, meta.error=<traceback>) and collection continues.
     An invalid episode is NEVER counted as a failure: success/label_failure are None. By default invalid files
     count as "done" on restart (so a deterministic crash is not retried forever); pass --retry_invalid to redo them.
   * After an exception the env is rebuilt, since its state is unknown.
 
 TODO (depends on spec freeze P0-1, intentionally stubbed): feature capture (FeatureCapture), the final dtype /
-layout / key set, inputs (A2, Dhyan), metadata fields (A3, Dhyan), token_probs.
+layout / key set, inputs (A2, Dhyan), metadata fields (A3, Dhyan).
 """
+import hashlib
 import json
 import os
+import shutil
+import socket
+import subprocess
 import sys
-import tempfile
 import time
 import traceback
 from dataclasses import dataclass, asdict
@@ -39,6 +52,7 @@ from libero.libero import benchmark
 sys.path.append("../..")
 from experiments.robot.libero.libero_utils import get_libero_dummy_action, get_libero_env, get_libero_image
 from experiments.robot.openvla_utils import get_processor
+from experiments.robot.unc_utils import compute_token_uncertainty_metrics
 from experiments.robot.robot_utils import (
     get_action,
     get_image_resize_size,
@@ -76,6 +90,8 @@ class CollectConfig:
 
     out_root: str = "./collect"
     retry_invalid: bool = False
+    stale_tmp_hours: float = 24.0                    # only temp files older than this (and with no live job) are removed
+    stale_lock_hours: float = 24.0                   # fallback lock expiry when job liveness cannot be determined
     # fmt: on
 
 
@@ -108,12 +124,115 @@ def episode_path(root: Path, task_id: int, init_state_idx: int, seed: int) -> Pa
     return root / f"task{task_id:02d}" / f"ep{init_state_idx:03d}_seed{seed}.pt"
 
 
-def atomic_save(obj, path: Path) -> int:
-    """Write to a temp file in the same directory, fsync, then rename. Returns bytes written."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+def job_identity() -> dict:
+    return {
+        "job_id": os.environ.get("SLURM_JOB_ID"),
+        "restart": os.environ.get("SLURM_RESTART_COUNT", "0"),
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "time": time.time(),
+    }
+
+
+def _tmp_id() -> str:
+    return os.environ.get("SLURM_JOB_ID") or str(os.getpid())
+
+
+def derive_episode_seed(base_seed: int, task_id: int, init_state_idx: int) -> int:
+    """Deterministic per-episode seed (independent of which episodes were skipped on resume)."""
+    h = hashlib.sha256(f"{base_seed}:{task_id}:{init_state_idx}".encode()).digest()
+    return int.from_bytes(h[:4], "big") % (2**31 - 1)
+
+
+def _slurm_job_running(job_id: str) -> Optional[bool]:
+    """True/False if squeue can tell us, None if unknown (no squeue / error)."""
     try:
-        with os.fdopen(fd, "wb") as f:
+        out = subprocess.run(["squeue", "-h", "-j", str(job_id), "-o", "%T"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        # squeue exits non-zero with "Invalid job id" for finished jobs on many configs, but also on real errors
+        return False if "Invalid job id" in out.stderr else None
+    return out.stdout.strip() != ""
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def holder_alive(holder: dict, max_age_h: float) -> bool:
+    me = job_identity()
+    same_job = holder.get("job_id") is not None and holder.get("job_id") == me["job_id"]
+    if same_job and holder.get("restart") != me["restart"]:
+        return False  # same Slurm job id, earlier incarnation (requeue): dead
+    if holder.get("host") == me["host"]:
+        return _pid_alive(int(holder.get("pid", -1)))  # same node: check the process directly
+    if holder.get("job_id"):
+        running = _slurm_job_running(holder["job_id"])
+        if running is not None:
+            return running
+    return (time.time() - float(holder.get("time", 0))) < max_age_h * 3600  # unknown: trust lock until it is old
+
+
+def lock_path(path: Path) -> Path:
+    return path.with_suffix(".lock")
+
+
+def try_claim(path: Path, max_age_h: float) -> bool:
+    """O_EXCL claim of an episode. False if another live job holds it."""
+    lp = lock_path(path)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                holder = json.loads(lp.read_text())
+            except Exception:
+                holder = {}  # unreadable lock (being written / corrupt): treat by age below
+                if time.time() - lp.stat().st_mtime < 60:
+                    return False
+            if holder and holder_alive(holder, max_age_h):
+                return False
+            # stale: move it aside (atomic) so we never delete a fresh lock another job just created
+            aside = lp.with_name(lp.name + f".stale.{_tmp_id()}.{int(time.time())}")
+            try:
+                os.rename(lp, aside)
+                print(f"[lock] reclaimed stale lock {lp.name} (holder={holder})")
+                aside.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(job_identity()))
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    return False
+
+
+def release_claim(path: Path) -> None:
+    lp = lock_path(path)
+    try:
+        holder = json.loads(lp.read_text())
+        if holder.get("pid") == os.getpid() and holder.get("host") == socket.gethostname():
+            lp.unlink()
+    except Exception:
+        pass
+
+
+def atomic_save(obj, path: Path) -> int:
+    """Write to a per-job temp file in the same directory, fsync, then rename. Returns bytes written."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{_tmp_id()}.tmp")
+    try:
+        with open(tmp, "wb") as f:
             torch.save(obj, f)
             f.flush()
             os.fsync(f.fileno())
@@ -121,17 +240,35 @@ def atomic_save(obj, path: Path) -> int:
         os.replace(tmp, path)  # atomic on POSIX within one filesystem
         return size
     except BaseException:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        if tmp.exists():
+            tmp.unlink()
         raise
 
 
-def remove_stale_tmp(root: Path) -> int:
+def remove_stale_tmp(root: Path, max_age_h: float) -> int:
+    """Remove only temp files older than max_age_h whose owning job (id in the file name) is not running."""
     n = 0
     for p in root.glob("task*/*.tmp"):
+        if time.time() - p.stat().st_mtime < max_age_h * 3600:
+            continue
+        owner = p.name[: -len(".tmp")].rsplit(".", 1)[-1]
+        if owner.isdigit() and _slurm_job_running(owner):
+            continue
         p.unlink()
         n += 1
     return n
+
+
+def quarantine(path: Path, root: Path, reason: str) -> Path:
+    """Move a bad episode file aside for debugging. Never deletes."""
+    qdir = root / "_quarantine"
+    qdir.mkdir(parents=True, exist_ok=True)
+    dest = qdir / f"{path.parent.name}__{path.name}.{time.strftime('%Y%m%dT%H%M%S')}.{_tmp_id()}"
+    shutil.move(str(path), str(dest))
+    print(f"[quarantine] {path} -> {dest} ({reason})")
+    with open(qdir / "quarantine_log.txt", "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{path}\t{dest}\t{reason}\n")
+    return dest
 
 
 def validate_episode_file(path: Path, task_id: int, init_state_idx: int, seed: int) -> Optional[str]:
@@ -163,6 +300,9 @@ def validate_episode_file(path: Path, task_id: int, init_state_idx: int, seed: i
         return "action_token_ids shape"
     if tuple(np.asarray(steps["executed_action"]).shape) != (T, ACTION_DIM):
         return "executed_action shape"
+    for k in ("token_probs", "token_entropy"):
+        if tuple(np.asarray(steps.get(k, [])).shape) != (T, ACTION_DIM):
+            return f"{k} shape"
     for k, v in steps.get("features", {}).items():
         if v.shape[0] != T:
             return f"feature {k} length {v.shape[0]} != {T}"
@@ -173,11 +313,12 @@ def validate_episode_file(path: Path, task_id: int, init_state_idx: int, seed: i
 # One episode
 # --------------------------------------------------------------------------------------------------
 def run_episode(cfg, model, processor, env, task_description, init_state, max_steps, resize_size, capture):
+    assert cfg.output_logits, "token_probs require output_logits=True"
     """Same control flow as run_libero_eval.py. Returns (steps_dict, success, n_steps)."""
     env.reset()
     obs = env.set_init_state(init_state)
     t = 0
-    s_list, env_t_list, tok_list, act_list = [], [], [], []
+    s_list, env_t_list, tok_list, act_list, prob_list, ent_list = [], [], [], [], [], []
     feats = {}
     success = False
     while t < max_steps + cfg.num_steps_wait:
@@ -207,6 +348,11 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
         env_t_list.append(t)
         tok_list.append(generated_outputs["sequences"][0, -ACTION_DIM:].cpu().numpy())
         act_list.append(np.asarray(actions, dtype=np.float32))
+        # Same computation as run_libero_eval.py logs: softmax over the action-bin slice of the logits;
+        # "prob" = max bin prob (== chosen token's prob under greedy when the argmax is a bin token).
+        m = compute_token_uncertainty_metrics(generated_outputs, model)
+        prob_list.append([m[f"token_{i}_prob"] for i in range(ACTION_DIM)])
+        ent_list.append([m[f"token_{i}_entropy"] for i in range(ACTION_DIM)])
 
         obs, reward, done, info = env.step(actions.tolist())
         if done:
@@ -220,7 +366,8 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
         "action_token_ids": np.stack(tok_list) if tok_list else np.zeros((0, ACTION_DIM), dtype=np.int64),
         "executed_action": np.stack(act_list) if act_list else np.zeros((0, ACTION_DIM), dtype=np.float32),
         "features": {k: torch.stack(v) for k, v in feats.items()},  # [T, 3, 4096] once capture is real
-        # TODO(P0-1): token_probs
+        "token_probs": np.asarray(prob_list, dtype=np.float32).reshape(-1, ACTION_DIM),
+        "token_entropy": np.asarray(ent_list, dtype=np.float32).reshape(-1, ACTION_DIM),
     }
     return steps, success, len(s_list)
 
@@ -263,7 +410,7 @@ def collect(cfg: CollectConfig) -> None:
 
     root = Path(cfg.out_root)
     root.mkdir(parents=True, exist_ok=True)
-    print(f"Removed {remove_stale_tmp(root)} stale temp files")
+    print(f"Removed {remove_stale_tmp(root, cfg.stale_tmp_hours)} stale temp files")
     (root / "collect_config.json").write_text(json.dumps(asdict(cfg), default=str, indent=2))
 
     capture = FeatureCapture()
@@ -285,37 +432,51 @@ def collect(cfg: CollectConfig) -> None:
                     if not (ep_meta["invalid"] and cfg.retry_invalid):
                         stats["skipped"] += 1
                         continue
+                    quarantine(path, root, "invalid episode, --retry_invalid")
                 else:
-                    print(f"[resume] {path.name} failed validation ({reason}); re-collecting")
-                path.unlink()
-
-            meta = base_meta(cfg, task_id, task_description, idx, unnorm_key)
-            t0 = time.time()
+                    quarantine(path, root, f"failed validation: {reason}")
+            if not try_claim(path, cfg.stale_lock_hours):
+                print(f"[lock] task {task_id} ep {idx} held by another live job; skipping")
+                stats["skipped"] += 1
+                continue
             try:
-                steps, success, n = run_episode(
-                    cfg, model, processor, env, task_description, initial_states[idx],
-                    MAX_STEPS_LIBERO_10, resize_size, capture,
-                )
-                meta.update(success=bool(success), label_failure=int(not success), length=n, invalid=False, error=None)
-                episode = {"meta": meta, "steps": steps}  # TODO(A2): "inputs"
-                stats["success" if success else "failure"] += 1
-            except Exception:
-                # Record and continue. NOT a failure: success/label_failure are None.
-                meta.update(success=None, label_failure=None, length=0, invalid=True, error=traceback.format_exc())
-                episode = {"meta": meta, "steps": {}}
-                stats["invalid"] += 1
-                print(f"[invalid] task {task_id} ep {idx}:\n{meta['error']}")
+                # Re-check after claiming: another job may have finished it between our check and our claim.
+                if path.exists() and validate_episode_file(path, task_id, idx, cfg.seed) is None:
+                    stats["skipped"] += 1
+                    continue
+                ep_seed = derive_episode_seed(cfg.seed, task_id, idx)
+                set_seed_everywhere(ep_seed)  # intentional deviation from SAFE (seeds once); makes resume reproducible
+                meta = base_meta(cfg, task_id, task_description, idx, unnorm_key)
+                meta["episode_seed"] = ep_seed
+                meta["episode_seed_derivation"] = "sha256(f'{base_seed}:{task_id}:{init_state_idx}')[:4] % (2**31-1)"
+                t0 = time.time()
                 try:
-                    env.close()
+                    steps, success, n = run_episode(
+                        cfg, model, processor, env, task_description, initial_states[idx],
+                        MAX_STEPS_LIBERO_10, resize_size, capture,
+                    )
+                    meta.update(success=bool(success), label_failure=int(not success), length=n, invalid=False, error=None)
+                    episode = {"meta": meta, "steps": steps}  # TODO(A2): "inputs"
+                    stats["success" if success else "failure"] += 1
                 except Exception:
-                    pass
-                env, task_description = get_libero_env(task, cfg.model_family, resolution=256)  # fresh env
-                capture.begin_action()  # clear any half-filled hook buffers
-            meta["wall_time_s"] = time.time() - t0
-            nbytes = atomic_save(episode, path)
-            stats["done"] += 1
-            print(f"task {task_id} ep {idx}: len={meta['length']} invalid={meta['invalid']} "
-                  f"steps/s={meta['length'] / max(meta['wall_time_s'], 1e-9):.2f} bytes={nbytes}")
+                    # Record and continue. NOT a failure: success/label_failure are None.
+                    meta.update(success=None, label_failure=None, length=0, invalid=True, error=traceback.format_exc())
+                    episode = {"meta": meta, "steps": {}}
+                    stats["invalid"] += 1
+                    print(f"[invalid] task {task_id} ep {idx}:\n{meta['error']}")
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+                    env, task_description = get_libero_env(task, cfg.model_family, resolution=256)  # fresh env
+                    capture.begin_action()  # clear any half-filled hook buffers
+                meta["wall_time_s"] = time.time() - t0
+                nbytes = atomic_save(episode, path)
+                stats["done"] += 1
+                print(f"task {task_id} ep {idx}: len={meta['length']} invalid={meta['invalid']} "
+                      f"steps/s={meta['length'] / max(meta['wall_time_s'], 1e-9):.2f} bytes={nbytes}")
+            finally:
+                release_claim(path)
         env.close()
         print(f"task {task_id} summary: {stats}")
     capture.detach()
