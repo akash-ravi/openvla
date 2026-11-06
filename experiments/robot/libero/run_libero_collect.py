@@ -300,8 +300,18 @@ def validate_episode_file(path: Path, task_id: int, init_state_idx: int, seed: i
         return "action_token_ids shape"
     if tuple(np.asarray(steps["executed_action"]).shape) != (T, ACTION_DIM):
         return "executed_action shape"
-    if len(steps.get("token_out_of_range", [])) != T or meta.get("n_out_of_range_token_steps") is None:
-        return "token_out_of_range / meta count missing"
+    for k in ("n_out_of_range_token_steps", "out_of_range_token_rate", "action_bin_token_range",
+              "n_tokens_at_bin_min_edge", "n_tokens_at_pad_edge"):
+        if meta.get(k) is None:
+            return f"meta.{k} missing"
+    if len(steps.get("token_out_of_range", [])) != T:
+        return "token_out_of_range length"
+    if int(np.asarray(steps["token_out_of_range"]).sum()) != meta["n_out_of_range_token_steps"]:
+        return "n_out_of_range_token_steps != sum(token_out_of_range)"
+    if int(np.asarray(steps["action_token_ids"]).reshape(-1).tolist().count(meta["action_bin_token_range"][1] + 1)) != meta["n_tokens_at_pad_edge"]:
+        return "n_tokens_at_pad_edge inconsistent with action_token_ids"
+    if int((np.asarray(steps["action_token_ids"]) == meta["action_bin_token_range"][0]).sum()) != meta["n_tokens_at_bin_min_edge"]:
+        return "n_tokens_at_bin_min_edge inconsistent with action_token_ids"
     for k in ("token_probs", "token_entropy"):
         if tuple(np.asarray(steps.get(k, [])).shape) != (T, ACTION_DIM):
             return f"{k} shape"
@@ -321,10 +331,14 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
     obs = env.set_init_state(init_state)
     t = 0
     s_list, env_t_list, tok_list, act_list, prob_list, ent_list, oor_list = [], [], [], [], [], [], []
-    # Action-bin token range = exactly the logits slice used for token_probs/entropy (unc_utils.py) and the range
-    # predict_action decodes: ids in [vocab_size - n_action_bins + 1, vocab_size].
+    n_min_edge = n_pad_edge = 0
+    # TRUE tokenizer action range (prismatic/vla/action_tokenizer.py: token = vocab_size - digitize(a), digitize in
+    # 1..n_bins): [vocab_size - n_bins, vocab_size - 1]  (31744..31999 for Llama-2 / 256 bins). Derived from config.
+    # NOTE: SAFE's uncertainty slice (unc_utils.py:29) is [vocab_size - n_bins + 1, vocab_size], off by one; we keep
+    # it for token_probs/token_entropy (baseline parity) but count the two edge cases below.
     vocab_size = model.config.text_config.vocab_size - model.config.pad_to_multiple_of
-    bin_lo, bin_hi = vocab_size - model.config.n_action_bins + 1, vocab_size
+    bin_lo, bin_hi = vocab_size - model.config.n_action_bins, vocab_size - 1
+    min_edge, pad_edge = vocab_size - model.config.n_action_bins, vocab_size
     feats = {}
     success = False
     while t < max_steps + cfg.num_steps_wait:
@@ -357,6 +371,10 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
         # Under greedy decoding the chosen token can fall outside the action bins; the fork then clips the action
         # and token_probs is NOT the chosen token's probability. We keep SAFE's prob definition and just count these.
         oor_list.append(bool(((tok < bin_lo) | (tok > bin_hi)).any()))
+        # token counts (not step counts): valid action at the -1.0.. edge whose SAFE prob is the max over OTHER bins,
+        # and the padding token that SAFE's slice wrongly includes
+        n_min_edge += int((tok == min_edge).sum())
+        n_pad_edge += int((tok == pad_edge).sum())
         act_list.append(np.asarray(actions, dtype=np.float32))
         # Same computation as run_libero_eval.py logs: softmax over the action-bin slice of the logits;
         # "prob" = max bin prob (== chosen token's prob under greedy when the argmax is a bin token).
@@ -381,6 +399,7 @@ def run_episode(cfg, model, processor, env, task_description, init_state, max_st
         "token_entropy": np.asarray(ent_list, dtype=np.float32).reshape(-1, ACTION_DIM),
     }
     steps["action_bin_range"] = (int(bin_lo), int(bin_hi))
+    steps["edge_counts"] = (n_min_edge, n_pad_edge)
     return steps, success, len(s_list)
 
 
@@ -468,10 +487,12 @@ def collect(cfg: CollectConfig) -> None:
                         MAX_STEPS_LIBERO_10, resize_size, capture,
                     )
                     oor = steps.pop("action_bin_range")
+                    n_min_edge, n_pad_edge = steps.pop("edge_counts")
                     meta.update(success=bool(success), label_failure=int(not success), length=n, invalid=False, error=None,
                                 n_out_of_range_token_steps=int(steps["token_out_of_range"].sum()),
                                 out_of_range_token_rate=float(steps["token_out_of_range"].mean()) if n else 0.0,
-                                action_bin_token_range=list(oor))
+                                action_bin_token_range=list(oor),
+                                n_tokens_at_bin_min_edge=int(n_min_edge), n_tokens_at_pad_edge=int(n_pad_edge))
                     episode = {"meta": meta, "steps": steps}  # TODO(A2): "inputs"
                     stats["success" if success else "failure"] += 1
                 except Exception:
