@@ -48,6 +48,7 @@ from experiments.robot.robot_utils import (
 from experiments.robot.viz_utils import (
     PoseCumulator
 )
+from experiments.robot.libero import episode_guard  # [Shared cache] invalid-episode markers (E2)
 from experiments.robot.unc_utils import (
     compute_token_uncertainty_metrics,
     compute_samples_uncertainty_metrics,
@@ -91,6 +92,7 @@ class GenerateConfig:
     task_start_index: Optional[int] = None                     # Start task index (inclusive)
     task_end_index: Optional[int] = None                       # End task index (inclusive)
     resume: bool = False                            # Resume from a previous run
+    max_invalid_episodes: int = 3                    # [Shared cache] With save_all_layers: abort once more episodes than this in the task range are invalid
 
     #################################################################################################################
     # Utils
@@ -175,10 +177,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
     total_episodes, total_successes = 0, 0
     task_start_index = cfg.task_start_index if cfg.task_start_index is not None else 0
     task_end_index = cfg.task_end_index + 1 if cfg.task_end_index is not None else num_tasks_in_suite
+    guard = episode_guard.EpisodeGuard(save_folder, cfg.max_invalid_episodes, range(task_start_index, task_end_index),
+                                       cfg.task_suite_name, cfg.seed) if cfg.save_all_layers else None
     for task_id in trange(task_start_index, task_end_index):
         if cfg.resume:
             # Check for existing saved results. 
             existing_results = list(save_folder.glob(f"task{task_id}--ep*--succ*.csv"))
+            if guard is not None:  # [Shared cache] an invalid-episode marker also counts as done
+                existing_results += episode_guard.invalid_markers(save_folder, task_id)
             # Get the maximum episode index existing
             max_existing_episode = max([int(str(p).split("--ep")[1].split("--")[0]) for p in existing_results]) if existing_results else -1
             if max_existing_episode + 1 >= cfg.num_trials_per_task:
@@ -202,6 +208,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in trange(start_episode, cfg.num_trials_per_task):
+            if guard is not None:  # [Shared cache] re-attempting an episode makes its old invalid marker obsolete
+                guard.discard_marker(task_id, episode_idx)
             print(f"\nTask: {task_description}")
             
             if cfg.use_wandb:
@@ -399,6 +407,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # log_file.write(f"Caught exception: {e}\n")
                     # excepted = True
                     # break
+                    # [Shared cache] Ordinary error -> invalid-episode marker, skip the episode; systemic errors re-raise
+                    if guard is not None and guard.record_invalid(e, task_id=task_id, episode_idx=episode_idx, step_index=t,
+                                                                  num_steps_wait=cfg.num_steps_wait,
+                                                                  policy_steps_completed=len(replay_images)):
+                        excepted = True
+                        break
                     raise e
                     
             if cfg.use_wandb:
@@ -420,6 +434,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     })
                 
                 wandb.finish(quiet=True)
+
+            if excepted:  # [Shared cache] invalid episode: no .mp4/.pkl/.layers.pt/.csv; reset the env and go on
+                env = guard.recover_env(env, lambda: get_libero_env(task, cfg.model_family, resolution=256)[0])
+                continue
 
             task_episodes += 1
             total_episodes += 1
@@ -470,8 +488,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
             print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
         # Log final results
-        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        print(f"Current task success rate: {float(task_successes) / float(max(task_episodes, 1))}")
+        print(f"Current total success rate: {float(total_successes) / float(max(total_episodes, 1))}")
         
     env.close()
 
