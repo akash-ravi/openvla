@@ -52,6 +52,12 @@ from experiments.robot.unc_utils import (
     compute_token_uncertainty_metrics,
     compute_samples_uncertainty_metrics,
 )
+from experiments.robot.libero.layer_cache import (
+    parse_pools,
+    pool_all_layers,
+    save_episode_layers,
+    write_provenance,
+)
 
 
 @dataclass
@@ -73,6 +79,8 @@ class GenerateConfig:
     output_logits: bool = True                       # Whether to output logits from the model
     output_attentions: bool = False                  # Whether to output attention weights from the model
     output_hidden_states: bool = False               # Whether to output hidden states from the model
+    save_all_layers: bool = False                    # [Shared cache] Also save ALL 33 hidden-state layers per step (needs output_hidden_states)
+    all_layers_pooling: str = "mean,first,last"      # [Shared cache] Reductions over the 7 action tokens to store
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -114,6 +122,11 @@ def eval_libero(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
 
+    if cfg.save_all_layers:
+        assert cfg.output_hidden_states, "save_all_layers requires --output_hidden_states True"
+        assert cfg.n_samples == 1, "save_all_layers is only supported for single-sample rollouts"
+        all_layer_pools = parse_pools(cfg.all_layers_pooling)
+
     # Set random seed
     set_seed_everywhere(cfg.seed)
 
@@ -154,6 +167,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
     save_root = Path(cfg.save_root)
     save_folder = save_root / f"{cfg.run_id_note}" /  f"{cfg.task_suite_name}"
     save_folder.mkdir(parents=True, exist_ok=True)
+    if cfg.save_all_layers:
+        prov_name = f"provenance--tasks{cfg.task_start_index}-{cfg.task_end_index}--job{os.environ.get('SLURM_JOB_ID', 'local')}.json"
+        write_provenance(save_folder / "provenance" / prov_name, cfg, model)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -229,6 +245,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
             logs_cum = defaultdict(float)
             pose_cumulator = PoseCumulator()
             hidden_states_episode = []
+            all_layers_episode = []
             logs_to_dump = []
             
             while t < max_steps + cfg.num_steps_wait:
@@ -285,6 +302,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         
                         # Save the hidden states for further analysis
                         hidden_states_episode.append(hidden_states_last_layer.detach().cpu())
+
+                        if cfg.save_all_layers:
+                            # (P, 33, 4096) bf16: every layer, pooled over the 7 action tokens
+                            all_layers_episode.append(pool_all_layers(all_hidden_states, all_layer_pools))
                         
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
@@ -423,7 +444,21 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 }
                 pickle.dump(save_dict, open(hidden_states_path, "wb"))
                 print(f"Saved hidden states at path {hidden_states_path}")
-                
+
+            # [Shared cache] Written BEFORE the csv: the csv is the "episode complete" marker used by --resume
+            if cfg.save_all_layers:
+                layers_path = mp4_path.with_suffix(".layers.pt")
+                save_episode_layers(layers_path, all_layers_episode, all_layer_pools, {
+                    "task_suite_name": cfg.task_suite_name,
+                    "task_id": task_id,
+                    "task_description": task_description,
+                    "episode_idx": episode_idx,
+                    "episode_success": bool(done),
+                    "init_state_index": episode_idx,
+                    "seed": cfg.seed,
+                })
+                print(f"Saved all-layer features at path {layers_path}")
+
             if cfg.save_logs:
                 logs_path = mp4_path.with_suffix(".csv")
                 df = pd.DataFrame(logs_to_dump)
