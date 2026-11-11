@@ -58,6 +58,11 @@ from experiments.robot.libero.layer_cache import (
     save_episode_layers,
     write_provenance,
 )
+from experiments.robot.libero.run_guards import (
+    add_fingerprint_to_provenance,
+    build_run_fingerprint,
+    require_flash_attention_2,
+)
 
 
 @dataclass
@@ -135,6 +140,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
     
     # Load model
     model = get_model(cfg)
+    if cfg.save_all_layers:
+        # [Run guards] Hard-fail unless the loaded model really runs flash_attention_2 (no sdpa/eager fallback)
+        run_fingerprint = build_run_fingerprint(require_flash_attention_2(model, cfg.attn_implementation))
 
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
@@ -170,6 +178,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if cfg.save_all_layers:
         prov_name = f"provenance--tasks{cfg.task_start_index}-{cfg.task_end_index}--job{os.environ.get('SLURM_JOB_ID', 'local')}.json"
         write_provenance(save_folder / "provenance" / prov_name, cfg, model)
+        add_fingerprint_to_provenance(save_folder / "provenance" / prov_name, run_fingerprint)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -456,6 +465,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     "episode_success": bool(done),
                     "init_state_index": episode_idx,
                     "seed": cfg.seed,
+                    "run_fingerprint": run_fingerprint,
                 })
                 print(f"Saved all-layer features at path {layers_path}")
 
