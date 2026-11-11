@@ -140,6 +140,11 @@ def rle(monkeypatch):
     spec = importlib.util.spec_from_file_location("rle_under_test", REPO / "experiments/robot/libero/run_libero_eval.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    # Fixes 3 and 5 also act on the loaded model; they have their own tests (test_kit_run_guards.py,
+    # test_kit_raw_block32.py). Here the model is a stand-in, so stub those two entry points.
+    m.require_flash_attention_2 = lambda model, requested: {
+        "attn_implementation": "flash_attention_2", "attention_classes": ["FakeFlashAttention2"]}
+    m.layer_names_for = lambda model, raw_block32: [f"layer{i:02d}" for i in range(N_LAYERS)]
     _new_scenario()
     return m
 
@@ -147,7 +152,8 @@ def rle(monkeypatch):
 def make_cfg(rle, tmp_path, **kw):
     base = dict(pretrained_checkpoint="fake", task_suite_name="libero_10", num_steps_wait=2, num_trials_per_task=4,
                 use_wandb=False, save_root=str(tmp_path), run_id_note="t", output_hidden_states=True,
-                save_all_layers=True, task_start_index=0, task_end_index=0, max_invalid_episodes=3)
+                save_all_layers=True, save_raw_block32=False, task_start_index=0, task_end_index=0,
+                max_invalid_episodes=3)
     base.update(kw)
     return rle.GenerateConfig(**base)
 
@@ -199,6 +205,22 @@ def test_resume_counts_marker_as_done_even_when_it_is_the_last_episode(rle, tmp_
     # finds every task of the range complete, independent of this fix
     rle.eval_libero(make_cfg(rle, tmp_path, resume=True, task_end_index=1))
     assert all(t == 1 for t, _ in SCEN["attempts"])  # task 0 ep3 is not retried: 3 csv + 1 marker = complete
+
+
+def test_resume_with_every_task_done_exits_cleanly(rle, tmp_path):
+    # SAFE's script ends with env.close(); when --resume finds the whole range complete no env exists.
+    # With save_all_layers the job must still finish normally (a retry loop would read a crash as failure).
+    SCEN["fail"][(0, 3)] = ("step", 0, ValueError("deterministic"))
+    rle.eval_libero(make_cfg(rle, tmp_path))
+    _new_scenario()
+    rle.eval_libero(make_cfg(rle, tmp_path, resume=True))  # must not raise UnboundLocalError
+    assert SCEN.get("attempts", []) == []
+
+
+def test_resume_with_every_task_done_without_flag_is_unchanged(rle, tmp_path):
+    rle.eval_libero(make_cfg(rle, tmp_path, save_all_layers=False))
+    with pytest.raises(UnboundLocalError):  # SAFE's original behaviour, deliberately untouched
+        rle.eval_libero(make_cfg(rle, tmp_path, save_all_layers=False, resume=True))
 
 
 def test_resume_after_kill_starts_after_the_marker(rle, tmp_path):
