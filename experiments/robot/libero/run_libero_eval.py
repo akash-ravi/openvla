@@ -54,6 +54,8 @@ from experiments.robot.unc_utils import (
     compute_samples_uncertainty_metrics,
 )
 from experiments.robot.libero.layer_cache import (
+    call_with_raw_block32,
+    layer_names_for,
     parse_pools,
     pool_all_layers,
     save_episode_layers,
@@ -85,8 +87,9 @@ class GenerateConfig:
     output_logits: bool = True                       # Whether to output logits from the model
     output_attentions: bool = False                  # Whether to output attention weights from the model
     output_hidden_states: bool = False               # Whether to output hidden states from the model
-    save_all_layers: bool = False                    # [Shared cache] Also save ALL 33 hidden-state layers per step (needs output_hidden_states)
+    save_all_layers: bool = False                    # [Shared cache] Also save ALL 33 hidden-state layers (+ raw block 32, see below) per step (needs output_hidden_states)
     all_layers_pooling: str = "mean,first,last"      # [Shared cache] Reductions over the 7 action tokens to store
+    save_raw_block32: bool = True                    # [Shared cache] With save_all_layers: add layer 33 = block-32 output BEFORE the final RMSNorm
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -181,6 +184,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
         prov_name = f"provenance--tasks{cfg.task_start_index}-{cfg.task_end_index}--job{os.environ.get('SLURM_JOB_ID', 'local')}.json"
         write_provenance(save_folder / "provenance" / prov_name, cfg, model)
         add_fingerprint_to_provenance(save_folder / "provenance" / prov_name, run_fingerprint)
+    if cfg.save_all_layers:  # [Shared cache] one name per saved layer index (33 or 34 layers)
+        all_layer_names = layer_names_for(model, cfg.save_raw_block32)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -292,7 +297,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     }
                     
                     # Query model to get action
-                    actions = get_action(
+                    actions, raw_block32 = call_with_raw_block32(cfg.save_all_layers and cfg.save_raw_block32, model, get_action,
                         cfg,
                         model,
                         observation,
@@ -321,8 +326,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         hidden_states_episode.append(hidden_states_last_layer.detach().cpu())
 
                         if cfg.save_all_layers:
-                            # (P, 33, 4096) bf16: every layer, pooled over the 7 action tokens
-                            all_layers_episode.append(pool_all_layers(all_hidden_states, all_layer_pools))
+                            # (P, 33 or 34, 4096) bf16: every layer (+ raw block 32), pooled over the 7 action tokens
+                            all_layers_episode.append(pool_all_layers(all_hidden_states, all_layer_pools, raw_block32))
                         
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
@@ -484,6 +489,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     "init_state_index": episode_idx,
                     "seed": cfg.seed,
                     "run_fingerprint": run_fingerprint,
+                    "layer_names": all_layer_names,
                 })
                 print(f"Saved all-layer features at path {layers_path}")
 
