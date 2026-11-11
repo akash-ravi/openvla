@@ -507,6 +507,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
         print(f"Current task success rate: {float(task_successes) / float(max(task_episodes, 1))}")
         print(f"Current total success rate: {float(total_successes) / float(max(total_episodes, 1))}")
         
+    if cfg.save_all_layers and "env" not in locals():
+        return  # [Shared cache] --resume found every task done: no env was created, and a finished job must exit 0
     env.close()
 
 
